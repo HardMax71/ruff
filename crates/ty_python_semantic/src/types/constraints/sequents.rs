@@ -53,6 +53,11 @@ pub(super) struct SequentMap<'db> {
     pending: Vec<Sequent<Constraint<'db>>>,
 }
 
+static EMPTY_SEQUENT_MAP: SequentMap<'static> = SequentMap {
+    sequents: Vec::new(),
+    pending: Vec::new(),
+};
+
 /// A batch of sequents, along with information about the order they need to be imported into a
 /// [`ConstraintSetBuilder`].
 ///
@@ -309,6 +314,26 @@ impl<'db> SequentMap<'db> {
         env: &ProgramEnvironment<'db>,
         constraint: Constraint<'db>,
     ) -> &'db Self {
+        // Most individual constraints produce no sequents. Avoid interning the query arguments
+        // and retaining an empty Salsa result for those cases. Keep the checks in sync with the
+        // single-constraint `add_sequents` methods below.
+        let may_produce_sequents = match constraint {
+            Constraint::ConcreteLower(bound) => {
+                bound.bound == bound.typevar.domain(db).bottom(db)
+                    || bound.bound == bound.typevar.domain(db).top(db)
+            }
+            Constraint::ConcreteUpper(bound) => {
+                bound.bound == bound.typevar.domain(db).top(db)
+                    || bound.bound == bound.typevar.domain(db).bottom(db)
+            }
+            Constraint::ConcreteEquivalence(_) => false,
+            Constraint::TypeVarRange(bound) => bound.left.is_same_typevar_as(db, bound.right),
+            Constraint::TypeVarEquivalence(bound) => bound.left.is_same_typevar_as(db, bound.right),
+        };
+        if !may_produce_sequents {
+            return &EMPTY_SEQUENT_MAP;
+        }
+
         #[salsa::tracked(
             returns(ref),
             cycle_initial=|_, _, _, _| SequentMap::default(),
@@ -1982,6 +2007,44 @@ mod tests {
 
     fn known_instance(db: &TestDb, class: KnownClass) -> Type<'_> {
         class.to_instance(db, &db.program_environment())
+    }
+
+    #[test]
+    fn single_constraint_shortcuts_match_sequent_derivation() {
+        let db = setup_db();
+        let db = &db;
+        let env = db.program_environment();
+        let t = create_typevar(db, "T");
+        let u = create_typevar(db, "U");
+        let provenance = ConstraintProvenance::Evidence;
+
+        let mut constraints: Vec<Constraint<'_>> = Vec::new();
+        for bound in [
+            t.domain(db).bottom(db),
+            t.domain(db).top(db),
+            known_instance(db, KnownClass::Int),
+        ] {
+            constraints.push(ConcreteLowerBound::new(provenance, t, bound).into());
+            constraints.push(ConcreteUpperBound::new(provenance, t, bound).into());
+            constraints.push(ConcreteEquivalenceBound::new(provenance, t, bound).into());
+        }
+        for right in [t, u] {
+            constraints.push(TypeVarRangeBound::new(db, provenance, t, right).into());
+            constraints.push(TypeVarEquivalenceBound::new(db, provenance, t, right).into());
+        }
+
+        for constraint in constraints {
+            let mut expected = SequentMap::default();
+            constraint.add_sequents(db, &env, &mut expected);
+            expected.finish();
+            let actual = SequentMap::for_constraint(db, &env, constraint);
+            assert_eq!(*actual, expected, "{constraint:?}");
+            assert_eq!(
+                std::ptr::eq(actual, &EMPTY_SEQUENT_MAP),
+                expected.sequents.is_empty(),
+                "{constraint:?}"
+            );
+        }
     }
 
     #[test]

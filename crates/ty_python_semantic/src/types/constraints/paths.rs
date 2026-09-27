@@ -13,6 +13,9 @@ use ruff_index::{IndexVec, newtype_index};
 
 use crate::types::constraints::sequents::{Sequent, SequentGroup, SequentMap};
 use crate::types::constraints::variables::Constraint;
+use crate::types::constraints::variables::Constraint::{
+    ConcreteEquivalence, ConcreteLower, ConcreteUpper, TypeVarEquivalence, TypeVarRange,
+};
 use crate::types::constraints::{
     ConstraintAssignment, ConstraintId, ConstraintSetStorage, Node, NodeId, PathVisitor,
     SourceOrderId, TypeVarId,
@@ -94,6 +97,35 @@ pub(crate) struct PathAssignments {
 /// The total amount of fuel that we are willing to spend for this path traversal. This was
 /// chosen empirically, to balance performance with accurate ecosystem diagnostics.
 const OVERALL_FUEL_BUDGET: u16 = 256;
+
+/// Whether two constraints with disjoint, complete supports can still derive sequents.
+///
+/// A concrete lower/upper, lower/equality, or upper/equality pair can relate its type variables
+/// through a shared concrete pivot. Every other pair requires a shared type variable.
+fn can_interact_without_shared_typevars(left: Constraint<'_>, right: Constraint<'_>) -> bool {
+    match (left, right) {
+        (ConcreteLower(_), ConcreteUpper(_) | ConcreteEquivalence(_))
+        | (ConcreteUpper(_) | ConcreteEquivalence(_), ConcreteLower(_))
+        | (ConcreteUpper(_), ConcreteEquivalence(_))
+        | (ConcreteEquivalence(_), ConcreteUpper(_)) => true,
+        (
+            ConcreteLower(_) | ConcreteUpper(_) | ConcreteEquivalence(_),
+            ConcreteLower(_) | ConcreteUpper(_) | ConcreteEquivalence(_),
+        )
+        | (
+            TypeVarRange(_) | TypeVarEquivalence(_),
+            ConcreteLower(_)
+            | ConcreteUpper(_)
+            | ConcreteEquivalence(_)
+            | TypeVarRange(_)
+            | TypeVarEquivalence(_),
+        )
+        | (
+            ConcreteLower(_) | ConcreteUpper(_) | ConcreteEquivalence(_),
+            TypeVarRange(_) | TypeVarEquivalence(_),
+        ) => false,
+    }
+}
 
 /// The maximum number of "trips through the sequent map" that we are willing to take for a
 /// derived constraint. This records how far removed we are from a constraint that comes
@@ -767,17 +799,22 @@ impl PathAssignments {
             let existing_support = storage.constraint_support(*existing);
             let constraint_support = storage.constraint_support(constraint);
 
-            // Independent typevars must be checked for disjoint or invalid constraints, but are
-            // otherwise already constrained and do not participate in sequent discovery.
-            if !existing_support.overlaps_with(constraint_support)
-                && existing_support
+            if existing_support.is_complete()
+                && constraint_support.is_complete()
+                && !existing_support.overlaps_with(constraint_support)
+            {
+                // Independent typevars must be checked for disjoint or invalid constraints, but
+                // are otherwise already constrained and do not participate in sequent discovery.
+                let independent = existing_support
                     .iter()
                     .chain(constraint_support.iter())
-                    .any(|typevar| self.independent_typevars.contains(&typevar))
-                && existing_support.is_complete()
-                && constraint_support.is_complete()
-            {
-                continue;
+                    .any(|typevar| self.independent_typevars.contains(&typevar));
+
+                if independent
+                    || !can_interact_without_shared_typevars(existing_data, constraint_data)
+                {
+                    continue;
+                }
             }
 
             if SequentMap::pair_cannot_produce_sequents(db, env, existing_data, constraint_data) {
@@ -1156,11 +1193,17 @@ struct PathAssignmentConflict;
 
 #[cfg(test)]
 mod tests {
+    use super::super::sequents::SequentMap;
     use super::super::solutions::SolutionWalker;
+    use super::super::variables::{
+        ConcreteEquivalenceBound, ConcreteLowerBound, ConcreteUpperBound, ConstraintProvenance,
+        TypeVarEquivalenceBound, TypeVarRangeBound,
+    };
     use super::super::*;
+    use super::can_interact_without_shared_typevars;
 
     use crate::db::tests::{TestDb, setup_db};
-    use crate::types::{BoundTypeVarInstance, KnownClass, TypeVarVariance};
+    use crate::types::{BoundTypeVarInstance, KnownClass, Type, TypeVarVariance};
     use ruff_python_ast::name::Name;
 
     fn create_typevar<'db>(db: &'db TestDb, name: &'static str) -> BoundTypeVarInstance<'db> {
@@ -1170,6 +1213,76 @@ mod tests {
             Name::new_static(name),
             TypeVarVariance::Invariant,
         )
+    }
+
+    #[test]
+    fn disjoint_typevar_support_only_needs_concrete_pivot_pairs() {
+        let db = setup_db();
+        let db = &db;
+        let env = db.program_environment();
+        let t = create_typevar(db, "T");
+        let u = create_typevar(db, "U");
+        let v = create_typevar(db, "V");
+        let w = create_typevar(db, "W");
+        let int = KnownClass::Int.to_instance(db, &env);
+        let provenance = ConstraintProvenance::Evidence;
+        let constraints = |first, second| -> [Constraint<'_>; 5] {
+            [
+                ConcreteLowerBound::new(provenance, first, int).into(),
+                ConcreteUpperBound::new(provenance, first, int).into(),
+                ConcreteEquivalenceBound::new(provenance, first, int).into(),
+                TypeVarRangeBound::new(db, provenance, first, second).into(),
+                TypeVarEquivalenceBound::new(db, provenance, first, second).into(),
+            ]
+        };
+
+        for left in constraints(t, u) {
+            for right in constraints(v, w) {
+                for (left, right) in [(left, right), (right, left)] {
+                    let may_interact = can_interact_without_shared_typevars(left, right);
+                    let sequents = SequentMap::for_constraint_pair(db, &env, left, right);
+                    assert_eq!(
+                        may_interact,
+                        !sequents.sequents.is_empty(),
+                        "{left:?}, {right:?}"
+                    );
+                }
+            }
+        }
+
+        // Range constraints with a shared type variable do interact, even though their kinds
+        // cannot interact when their supports are disjoint.
+        let left = TypeVarRangeBound::new(db, provenance, t, u).into();
+        let right = TypeVarRangeBound::new(db, provenance, u, v).into();
+        assert!(!can_interact_without_shared_typevars(left, right));
+        assert!(
+            !SequentMap::for_constraint_pair(db, &env, left, right)
+                .sequents
+                .is_empty()
+        );
+
+        // A type variable nested inside a bound also belongs to the constraint's support.
+        let left = ConcreteLowerBound::new(
+            provenance,
+            t,
+            Type::homogeneous_tuple(db, &env, Type::TypeVar(u)),
+        )
+        .into();
+        let right = ConcreteLowerBound::new(provenance, u, int).into();
+        let mut storage = ConstraintSetStorage::default();
+        let left_id = storage.intern_constraint(db, &env, left);
+        let right_id = storage.intern_constraint(db, &env, right);
+        assert!(storage.constraint_support(left_id).is_complete());
+        assert!(
+            storage
+                .constraint_support(left_id)
+                .overlaps_with(storage.constraint_support(right_id))
+        );
+        assert!(
+            !SequentMap::for_constraint_pair(db, &env, left, right)
+                .sequents
+                .is_empty()
+        );
     }
 
     fn create_constraint<'db, 'c>(
